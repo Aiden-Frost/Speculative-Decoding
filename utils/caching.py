@@ -1,4 +1,4 @@
-from typing import Tuple, Union
+from typing import Tuple, Union, List
 from torch import Tensor
 from transformers.cache_utils import DynamicCache
 
@@ -55,13 +55,14 @@ def prune_tuple_cache(cache: Tuple[Tuple[Tensor, Tensor]], num_tokens_to_discard
     return tuple(new_cache)
 
 
-def prune_dynamic_cache(cache: DynamicCache, num_tokens_to_discard: int):
+def prune_dynamic_cache(cache: DynamicCache, num_tokens_to_discard: int, skip_cross_attention_layers: List = None):
     """
     Prune the cache by removing the specified number of tokens from the end. This pruning works for models using DynamicCache.
 
     Args:
         cache (DynamicCache): The KV cache to be pruned.
         num_tokens_to_discard (int): The number of tokens to discard from the end of the cache.
+        skip_cross_attention_dimension (int): Cross Attention KV cache to be skipped, provide the indices in KV cache.
 
     Returns:
         DynamicCache: The pruned KV cache. (same instance as the input cache, but modified in place)
@@ -70,6 +71,8 @@ def prune_dynamic_cache(cache: DynamicCache, num_tokens_to_discard: int):
         return None
 
     for layer in range(len(cache)):
+        if skip_cross_attention_layers and layer in skip_cross_attention_layers:
+            continue
         cache.key_cache[layer] = cache.key_cache[layer][:, :, :-num_tokens_to_discard, :]
         cache.value_cache[layer] = cache.value_cache[layer][:, :, :-num_tokens_to_discard, :]
     cache._seen_tokens -= num_tokens_to_discard
