@@ -323,8 +323,10 @@ class InferenceCLI:
         if self.spec:
             self._set_seed(42)
             spec_start_time = time.time()
-            # for continuing chat, need to modify the tokenizer and prefill to ensure that only new image is passed.
-            # Mllma only works good with 1 image -- https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct/discussions/43#66f98f742094ed9e5f5107d4
+            """
+            for continuing chat, need to modify the tokenizer and prefill to ensure that only new image is passed.
+            Mllma only works good with 1 image -- https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct/discussions/43#66f98f742094ed9e5f5107d4
+            """
             output_ids, accept_rate, _, _ = speculative_generate_llama_vision(
                 tokenized,
                 self.drafter,
