@@ -2,7 +2,7 @@ import torch
 from torch.nn import Module
 from utils.logits_processor import LogitsProcessor, GreedyProcessor
 from transformers.cache_utils import DynamicCache
-from utils.caching import prune_cache
+from utils.caching import prune_cache, prune_dynamic_cache
 import utils.printing as printing
 from typing import List, Tuple
 
@@ -187,3 +187,191 @@ def speculative_generate(
             return input_ids[0, prompt_len:current_position].tolist(), drafts_accepted / drafts_speculated
     
     return input_ids[0, prompt_len:].tolist(), drafts_accepted / drafts_speculated
+
+
+@torch.no_grad()
+def speculative_generate_llama_vision(
+    inputs,
+    drafter: Module,
+    target: Module,
+    tokenizer = None,
+    gamma: int = 5,
+    logits_processor: LogitsProcessor = GreedyProcessor(),
+    max_gen_len: int = 40,
+    eos_tokens_id: int | List[int] = 1,
+    pad_token_id: int = 0,
+    use_cache: bool = False,
+    skip_sample_adjustment: bool = False,
+    first_target: bool = True,
+    debug: bool = False,
+    drafter_cache: DynamicCache = None,
+    target_cache: DynamicCache = None,
+) -> Tuple[List[int], float, DynamicCache, DynamicCache]:
+
+
+    list_tokens_id = eos_tokens_id if isinstance(eos_tokens_id, list) else [eos_tokens_id]
+    stop_tokens = torch.tensor(list_tokens_id, dtype=torch.long, device=target.device).unsqueeze(1)
+    
+    drafts_accepted, drafts_speculated = .0, .0
+    
+    vocabulary_size = target.config.text_config.vocab_size
+
+    # prepare input tensor
+    prompt_len = len(inputs["input_ids"][0])
+    max_seq_length = target.config.max_position_embeddings if hasattr(target.config, 'max_position_embeddings') else (target.config.max_context_length if hasattr(target.config, 'max_context_length') else 1024)
+    total_len = min(max_seq_length, prompt_len + max_gen_len)
+    input_ids = torch.full((1, total_len), pad_token_id, dtype=torch.long, device=target.device)
+    input_ids[0, :prompt_len] = inputs["input_ids"][0].to(dtype=torch.long, device=target.device)
+    
+    current_position = prompt_len
+
+    Mp = target(
+        input_ids=input_ids[..., :current_position],
+        past_key_values=target_cache,
+        use_cache=True,
+        attention_mask=inputs["attention_mask"],
+        cross_attention_mask=inputs["cross_attention_mask"],
+        pixel_values=inputs["pixel_values"],
+        aspect_ratio_ids=inputs["aspect_ratio_ids"],
+        aspect_ratio_mask=inputs["aspect_ratio_mask"],
+    )
+    target_cache = Mp.past_key_values
+
+    input_ids = input_ids.to(drafter.device)
+    Mq = drafter(
+        input_ids=input_ids[..., :current_position],
+        past_key_values=drafter_cache,
+        use_cache=True,
+        attention_mask=inputs["attention_mask"],
+        cross_attention_mask=inputs["cross_attention_mask"],
+        pixel_values=inputs["pixel_values"],
+        aspect_ratio_ids=inputs["aspect_ratio_ids"],
+        aspect_ratio_mask=inputs["aspect_ratio_mask"],
+    )
+    drafter_cache = Mq.past_key_values
+
+    draft_num_input = 1
+
+    if first_target:
+        input_ids = input_ids.to(target.device)
+        p_p = logits_processor(Mp.logits[..., -1, :])
+        t = logits_processor.sample(p_p)
+        input_ids[0, current_position] = t
+        current_position += 1
+        
+        if torch.isin(t, stop_tokens):
+            if debug:
+                printing.end_token_found(0)
+            return input_ids[0, prompt_len:current_position].tolist(), 0, drafter_cache, target_cache
+        
+        if debug:
+            printing.initial_step(t, tokenizer)
+    
+    while current_position < total_len:
+
+        corrected_gamma = min(gamma, total_len - current_position - 1)
+        q = torch.zeros((1, corrected_gamma, vocabulary_size), device=target.device)
+        input_ids = input_ids.to(drafter.device)
+        
+        for k in range(corrected_gamma):
+            draft_model_input = input_ids[..., current_position + k - draft_num_input : current_position + k]
+            total_input = input_ids[..., :current_position + k] 
+            draft_attention_mask=torch.ones((1, total_input.shape[1])).contiguous().to(target.device)
+            draft_cross_attention_mask=torch.ones((1, draft_model_input.shape[1], 1, 4)).contiguous().to(target.device)
+            Mq = drafter(
+                input_ids=draft_model_input,
+                past_key_values=drafter_cache,
+                use_cache=True,
+                attention_mask=draft_attention_mask,
+                cross_attention_mask=draft_cross_attention_mask,
+            )
+
+            draft_num_input = 1
+
+            drafter_cache = Mq.past_key_values
+            draft_logits = Mq.logits[..., -1, :]
+            draft_probs = logits_processor(draft_logits)
+            q[0, k] = draft_probs.to(target.device)
+            xi = logits_processor.sample(draft_probs)
+            input_ids[0, current_position + k] = xi
+
+        drafts_speculated += corrected_gamma
+        input_ids = input_ids.to(target.device)
+        
+        # run target model on drafts and get logits of the previous tokens plus one more token
+        target_model_input = input_ids[..., current_position-1:current_position + corrected_gamma]
+        total_input = input_ids[..., :current_position + corrected_gamma]
+        target_attention_mask=torch.ones((1, total_input.shape[1])).contiguous().to(target.device)
+        target_cross_attention_mask=torch.ones((1, target_model_input.shape[1], 1, 4)).contiguous().to(target.device)
+
+        Mp = target(
+            input_ids=target_model_input,
+            past_key_values=target_cache,
+            use_cache=True,
+            attention_mask=target_attention_mask,
+            cross_attention_mask=target_cross_attention_mask,
+        )
+
+        target_cache = Mp.past_key_values
+        draft_logits = Mp.logits[..., :-1, :]
+        p = logits_processor(draft_logits)
+        
+        # compute the last accepted draft position (rejection sampling)
+        r = torch.rand(corrected_gamma, device=target.device)
+        fractions = p / q
+        valid_tokens = corrected_gamma
+        for i in range(corrected_gamma):
+            #if r[i] > fractions[0, i, input_ids[0, current_position + i]]:
+            """
+            Reference: https://github.com/huggingface/transformers/blob/849367ccf741d8c58aa88ccfe1d52d8636eaf2b7/src/transformers/generation/utils.py#L4356
+            The tokens generated by speculative decoding can be different from target model: https://github.com/huggingface/transformers/issues/25420#issuecomment-1775317535
+            """
+            if logits_processor.sample(p[0, i]) != logits_processor.sample(q[0, i]):
+                valid_tokens = i
+                break
+        
+        drafts_accepted += valid_tokens
+        
+        # check if the end token is in the drafts
+        stop_locations = torch.nonzero(torch.eq(input_ids[..., current_position:current_position + valid_tokens], stop_tokens))
+        if stop_locations.shape[0] > 0:
+            stop_location = stop_locations[0, 1].item()
+            if debug:
+                printing.end_token_found(stop_location)
+            return input_ids[0, prompt_len:current_position + stop_location + 1].tolist(), drafts_accepted / drafts_speculated, drafter_cache, target_cache
+
+        # adjust the distribution from Mp
+        if valid_tokens == corrected_gamma:
+            p_p = Mp.logits[...,- 1, :]
+            p_p = logits_processor(p_p)
+            draft_num_input = 2
+        else:
+            # prune the cache
+            drafter_cache = prune_dynamic_cache(drafter_cache, corrected_gamma - valid_tokens, drafter.config.text_config.cross_attention_layers)
+            target_cache = prune_dynamic_cache(target_cache, corrected_gamma - valid_tokens + 1, target.config.text_config.cross_attention_layers)
+            draft_num_input = 1
+            
+            if not skip_sample_adjustment:
+                p_p = p[..., valid_tokens, :] #p_p = max_fn(p[..., valid_tokens, :] - q[0, valid_tokens, :])
+            else:
+                p_p = p[..., valid_tokens, :]
+
+        x = logits_processor.sample(p_p)
+        
+        if debug:
+            generated = input_ids.clone().detach()
+            
+        input_ids[0, current_position + valid_tokens:current_position + corrected_gamma] = pad_token_id
+        input_ids[0, current_position + valid_tokens] = x
+        
+        if debug:
+            printing.speculative_step(tokenizer, generated, input_ids, valid_tokens, prompt_len, current_position, corrected_gamma)
+            
+        current_position += valid_tokens + 1
+        
+        if torch.isin(x, stop_tokens):
+            if debug:
+                printing.end_token_found(valid_tokens)
+            return input_ids[0, prompt_len:current_position].tolist(), drafts_accepted / drafts_speculated, drafter_cache, target_cache
+    
+    return input_ids[0, prompt_len:].tolist(), drafts_accepted / drafts_speculated, drafter_cache, target_cache

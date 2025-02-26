@@ -1,14 +1,20 @@
 import argparse
 import random
+import re
+import requests
+from PIL import Image
+from io import BytesIO
 import numpy as np
 import torch
-from sampling import autoregressive_generate, speculative_generate
+from sampling import autoregressive_generate, speculative_generate, speculative_generate_llama_vision
 from ngram_assisted import OneLevelNGramStorage, NGramStorage, ngram_assisted_speculative_generate
 from utils.logits_processor import GreedyProcessor, MultinomialProcessor, TopKProcessor, NucleusProcessor, TopKNucleusProcessor
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     QuantoConfig,
+    MllamaForConditionalGeneration, 
+    AutoProcessor
 )
 import time
 import os
@@ -27,17 +33,20 @@ class InferenceCLI:
 
         self.gamma = 4
         self.gen_len = 35
-        self.debug = False
+        self.debug = True
         self.spec = True
         self.dr = False
-        self.cache = False
-        self.target_gen = True
+        self.cache = True
+        self.target_gen = False
         # Ngram Assisted Generation
-        self.ngram_gen = True
+        self.ngram_gen = False
         self.ngram = None
         self.top_k_filler = 3
         self.ngram_n = 3
         self.reset_in_between = True
+
+        self.target_cache = None
+        self.draft_cache = None
         
         self.chat = True # If using a chat instructed model, set to True
         
@@ -74,40 +83,43 @@ class InferenceCLI:
         self._run()
 
     def _load_models(self):
-        # Target model
-        target_model = "meta-llama/Llama-3.2-3B-Instruct"
-        target_quantize = QuantoConfig(weights="int8")  # QuantoConfig(weights="int8")  None
-        
-        # Drafter model
-        drafter_model = "meta-llama/Llama-3.2-1B-Instruct"
-        drafter_quantize = QuantoConfig(weights="int8")  # QuantoConfig(weights="int8") None
+
+        drafter_model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+        target_model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
 
         print(colored("Target model:", on_color="on_yellow"), target_model)
         print(colored("Drafter model:", on_color="on_yellow"), drafter_model)
         print(colored("Loading models...", "light_grey"))
 
-        self.target = AutoModelForCausalLM.from_pretrained(
-            target_model,
-            quantization_config=target_quantize,
-            device_map=self.device,
-            trust_remote_code=True,
+        
+        self.drafter = MllamaForConditionalGeneration.from_pretrained(
+            drafter_model,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            cache_dir="/scratch/rr4549/.cache"
         )
+        self.drafter_preprocess = AutoProcessor.from_pretrained(drafter_model, cache_dir="/scratch/rr4549/.cache")
+        self.drafter.eval()
+
+        self.target = MllamaForConditionalGeneration.from_pretrained(
+            target_model,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            cache_dir="/scratch/rr4549/.cache"
+        )
+
+        self.target.tie_weights()
+        self.target_preprocess = AutoProcessor.from_pretrained(target_model, cache_dir="/scratch/rr4549/.cache")
+        
         self.target.eval()
+
 
         tokenizer_name = target_model
         if tokenizer_name != target_model:
             print(colored("Warning: Tokenizer is different from target model. Use with caution.", "red"))
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
-
-        self.drafter = AutoModelForCausalLM.from_pretrained(
-            drafter_model,
-            quantization_config=drafter_quantize,
-            device_map=self.device,
-            trust_remote_code=True,
-        )
-        self.drafter.eval()
         
-        self.ngram = NGramStorage(n=3, vocab_size=self.target.config.vocab_size)
+        self.ngram = NGramStorage(n=3, vocab_size=self.target.config.text_config.vocab_size)
         
         self.end_tokens = [self.tokenizer.eos_token_id, self.tokenizer.convert_tokens_to_ids("<|eot_id|>")] # "<|eot_id|>" is the end of turn token for Llama model.
 
@@ -265,10 +277,41 @@ class InferenceCLI:
         
 
     def _infer(self, prefix: str):
-        if self.chat:
-            prefix = self.tokenizer.apply_chat_template([{"role": "user", "content": prefix}], add_generation_prompt=True, tokenize=False)
+
+        # image=https://huggingface.co/datasets/huggingface/documentation-images/resolve/0052a70beed5bf71b92610a43a52df6d286cd5f3/diffusers/rabbit.jpg; text=Describe this image in two sentences.
+        match = re.search(r'image=(.*?); text=(.*)', prefix)
+        if match:
+            image_path = match.group(1).strip()
+            text = match.group(2).strip()
             
-        tokenized = self.tokenizer(prefix, return_tensors="pt").input_ids[0].tolist()
+            if image_path.startswith("http"):
+                response = requests.get(image_path)
+                if response.status_code == 200:
+                    image = Image.open(BytesIO(response.content))
+                else:
+                    print(colored("Failed to fetch image from URL", "red"))
+                    return
+            elif os.path.exists(image_path):
+                image = Image.open(image_path)
+            else:
+                print(colored("Invalid Image path", "red"))
+        else:
+            print(colored("Invalid input format, expected: image=(.*?); text=(.*)", "red"))
+       
+        messages = [
+            {"role": "user", "content": [
+                {"type": "image"},
+                {"type": "text", "text": text}
+            ]}
+        ]
+            
+        input_text = self.target_preprocess.apply_chat_template(messages, add_generation_prompt=True)
+        tokenized = self.target_preprocess(
+            image,
+            input_text,
+            add_special_tokens=False,
+            return_tensors="pt"
+        ).to(self.target.device)
         
         if self.reset_in_between:
             self.ngram.reset()
@@ -280,7 +323,11 @@ class InferenceCLI:
         if self.spec:
             self._set_seed(42)
             spec_start_time = time.time()
-            output_ids, accept_rate = speculative_generate(
+            """
+            for continuing chat, need to modify the tokenizer and prefill to ensure that only new image is passed.
+            Mllma only works good with 1 image -- https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct/discussions/43#66f98f742094ed9e5f5107d4
+            """
+            output_ids, accept_rate, _, _ = speculative_generate_llama_vision(
                 tokenized,
                 self.drafter,
                 self.target,
@@ -290,7 +337,9 @@ class InferenceCLI:
                 max_gen_len=self.gen_len,
                 eos_tokens_id=self.end_tokens,
                 debug=self.debug,
-                use_cache=self.cache,
+                use_cache=True, # always True
+                drafter_cache = self.draft_cache,
+                target_cache = self.target_cache,
             )
             spec_end_time = time.time()
             spec_output = self.tokenizer.decode(output_ids, skip_special_tokens=True)
